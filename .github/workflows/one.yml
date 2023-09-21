@@ -1,0 +1,139 @@
+name: Promote
+ 
+on:
+  repository_dispatch:
+    types: [Promote]
+  workflow_dispatch:
+    # Input has to be a string, not an array/list
+    # https://github.com/actions/toolkit/issues/184
+    inputs:
+      VERSION:
+        description: 'Image Version'
+        required: true
+        default: '0.1.0'
+      VERSION_TYPE:
+        description: 'New Version Identifer:
+          major | minor | patch | premajor | preminor | prepatch'
+        required: true
+        default: 'patch'
+ 
+env:
+  GH_PACKAGES: ghcr.io/ventera-corporation/dhs-odos-challenge-ui
+  GH_USER_NAME: ${{ secrets.VSTART_SERVICE_USER }}
+ 
+jobs:
+  Promote-TEST:
+    if: ${{ github.event.client_payload.ENVIRONMENT == 'test' }}
+    runs-on: ubuntu-latest
+    steps:
+      ### Setup
+      - name: Setup Repository Dispatch Action
+        if: ${{ github.event.inputs.VERSION_TYPE == '' }}
+        run: |
+          echo "VERSION_TYPE=patch" >> $GITHUB_ENV
+          echo "VERSION=${{ github.event.client_payload.VERSION }}" >> $GITHUB_ENV
+      - name: Setup Workflow Dispatch Action
+        if: ${{ !(github.event.inputs.VERSION_TYPE == '') }}
+        run: |
+          echo "VERSION_TYPE=${{ github.event.inputs.VERSION_TYPE }}" >> $GITHUB_ENV
+          echo "VERSION=${{ github.event.inputs.VERSION}}" >> $GITHUB_ENV
+      ### Deploy to TEST
+      - name: Deploy to TEST
+        uses: peter-evans/repository-dispatch@v1
+        with:
+          client-payload: '{"ENVIRONMENT": "test","REF": "${{ github.ref }}","VERSION": "${{ env.VERSION }}"}'
+          event-type: Deploy
+          token: ${{ secrets.VSTART_GPM_AUTH }}
+      ### Status Checks
+      - name: Security Dispatch Action
+        uses: peter-evans/repository-dispatch@v1
+        with:
+          client-payload: '{"ENVIRONMENT": "stage","REF": "${{ github.ref }}"}'
+          event-type: Security
+          token: ${{ secrets.VSTART_GPM_AUTH }}
+ 
+  Promote-STAGE:
+    if: ${{ github.event.client_payload.ENVIRONMENT == 'stage' }}
+    runs-on: ubuntu-latest
+    steps:
+      ### Setup
+      - name: Before Checkout
+        uses: actions/checkout@v2
+        with:
+          ref: ${{ github.event.client_payload.SHA_BEFORE }}
+      - name: After Checkout
+        uses: actions/checkout@v2
+        with:
+          ref: ${{ github.event.client_payload.SHA_AFTER }}
+      - name: Setup Repository Dispatch Action
+        if: ${{ github.event.inputs.VERSION_TYPE == '' }}
+        run: |
+          echo "VERSION_TYPE=patch" >> $GITHUB_ENV
+          echo "VERSION=${{ github.event.client_payload.VERSION }}" >> $GITHUB_ENV
+      - name: Setup Workflow Dispatch Action
+        if: ${{ !(github.event.inputs.VERSION_TYPE == '') }}
+        run: |
+          echo "VERSION_TYPE=${{ github.event.inputs.VERSION_TYPE }}" >> $GITHUB_ENV
+          echo "VERSION=${{ github.event.inputs.VERSION}}" >> $GITHUB_ENV
+      ### Version and Tag
+      - name: Default Checkout
+        uses: actions/checkout@v2
+      - name: Generate Change Log
+        run: |
+          git log --oneline ${{ github.event.client_payload.SHA_BEFORE }}..${{ github.event.client_payload.SHA_AFTER }} --pretty="- %s" > CHANGELOG.md
+          git log --oneline ${{ github.event.client_payload.SHA_BEFORE }}..${{ github.event.client_payload.SHA_AFTER }} --pretty="- %s" >> FULLCHANGELOG.md
+      - name: Update Version
+        run: |
+          git config --global user.name ${{ env.GH_USER_NAME }}
+          git config --global user.email ${{ env.GH_USER_NAME }}@users.noreply.github.com
+          echo "//npm.pkg.github.com/:_authToken=${{ secrets.VSTART_GPM_AUTH }}" > .npmrc
+          echo "@ventera-corporation:registry=https://npm.pkg.github.com/" >> .npmrc
+          echo "LATEST_VERSION=$(npm view @ventera-corporation/dhs-odos-challenge-ui version)" >> $GITHUB_ENV
+          echo "NEW_VERSION=$(npm version ${{ env.VERSION_TYPE }} --no-git-tag-version | awk -F'v' '{print $2}')" >> $GITHUB_ENV
+      - name: Check Deployed Version for Additional Updates
+        if: ${{ env.LATEST_VERSION == env.NEW_VERSION }}
+        run: |
+          sed -i -e 's/\("version": "\)[^"]*\("\)/\1${{ env.LATEST_VERSION }}\2/g' package.json
+          sed -i -e 's/\("version": "\)[^"]*\("\)/\1${{ env.LATEST_VERSION }}\2/g' package-lock.json
+          echo "NEW_VERSION=$(npm version ${{ env.VERSION_TYPE }} --no-git-tag-version | awk -F'v' '{print $2}')" >> $GITHUB_ENV
+      - name: Commit and Tag
+        run: |
+          rm .npmrc
+          git add CHANGELOG.md package.json package-lock.json
+          git commit -am 'Update Version for Release'
+          git tag -a v${{ env.NEW_VERSION }} -m "v${{ env.NEW_VERSION }}" -f
+          git push --tags -f
+      ### Create Release PR
+      - name: Create Pull Request for Release
+        uses: peter-evans/create-pull-request@v3
+        with:
+          author: "${{ env.GH_USER_NAME }} <${{ env.GH_USER_NAME }}s@users.noreply.github.com>"
+          base: main
+          branch: build-promotion
+          #branch-suffix: short-commit-hash
+          committer: "${{ env.GH_USER_NAME }} <${{ env.GH_USER_NAME }}s@users.noreply.github.com>"
+          delete-branch: true
+          title: 'Release PR'
+          body: |
+            - Auto-generated PR for Release
+            - View CHANGELOG.md for Changes
+          assignees: ${{ env.GH_USER_NAME }}
+          reviewers: ${{ env.GH_USER_NAME }}
+          draft: false
+          token: ${{ secrets.VSTART_GPM_AUTH }}
+ 
+      ### Deploy to Stage
+      - name: Deploy to STAGE
+        uses: peter-evans/repository-dispatch@v1
+        with:
+          client-payload: '{"ENVIRONMENT": "stage","REF": "${{ github.ref }}","VERSION": "${{ env.NEW_VERSION }}"}'
+          event-type: Deploy
+          token: ${{ secrets.VSTART_GPM_AUTH }}
+ 
+      ### Status Checks
+      - name: Security Dispatch Action
+        uses: peter-evans/repository-dispatch@v1
+        with:
+          client-payload: '{"ENVIRONMENT": "stage","REF": "build-promotion"}'
+          event-type: Security
+          token: ${{ secrets.VSTART_GPM_AUTH }}
